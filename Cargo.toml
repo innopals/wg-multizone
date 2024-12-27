@@ -1,0 +1,42 @@
+[package]
+name = "wg-multizone"
+version = "1.0.0"
+edition = "2021"
+
+[[bin]]
+name = "wg-multizone"
+path = "src/main.rs"
+
+[profile.release]
+debug = false
+lto = true
+strip = true
+opt-level = 3
+
+[dependencies]
+anyhow = "1.0.95"
+base64 = "0.22.1"
+hex = "^0.4.3"
+reqwest = { version = "0.12.10", features = ["json"] }
+serde = { version = "1.0.216", features = ["derive"] }
+serde_json = "^1.0.134"
+thiserror = "2.0.9"
+tokio = { version = "1.42.0", features = ["full"] }
+tracing = "0.1.41"
+tracing-subscriber = "0.3.19"
+tracing-appender = "^0.2.3"
+x25519-dalek = { version = "2.0.1", features = ["getrandom", "static_secrets"] }
+
+[dependencies.defguard_wireguard_rs]
+package = "defguard_wireguard_rs"
+git = "https://github.com/DefGuard/wireguard-rs.git"
+rev = "v0.6.1"
+
+[target.'cfg(not(any(target_os = "macos", target_os="windows", target_arch = "arm")))'.dependencies]
+tikv-jemallocator = "0.6.0"
+
+[workspace.metadata.cross.target.x86_64-unknown-linux-gnu]
+image = "ghcr.io/cross-rs/x86_64-unknown-linux-gnu:main-centos"
+
+[workspace.metadata.cross.target.aarch64-unknown-linux-gnu]
+image = "ghcr.io/cross-rs/aarch64-unknown-linux-gnu:main-centos"
