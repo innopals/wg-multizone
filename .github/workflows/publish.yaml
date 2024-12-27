@@ -1,0 +1,43 @@
+name: Continuous Integration (CI)
+on: [push]
+
+concurrency:
+  group: "ci-${{ github.ref_name }}"
+  cancel-in-progress: true
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        arch:
+          - target: x86_64-unknown-linux-gnu
+            name: amd64
+          - target: aarch64-unknown-linux-gnu
+            name: aarch64
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+      - name: Install Rust with Cross
+        shell: bash
+        run: |
+          curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- --default-toolchain none -y
+          rustup toolchain install stable --profile minimal
+          rustup target add ${{ matrix.arch.target }}
+          curl -L --proto '=https' --tlsv1.2 -sSf https://raw.githubusercontent.com/cargo-bins/cargo-binstall/main/install-from-binstall-release.sh | bash
+          cargo binstall --no-confirm cross
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: ${{ matrix.arch.target }}
+          cache-on-failure: true
+      - name: Build Binary
+        run: |
+          cross build --verbose --locked --release --target ${{ matrix.arch.target }}
+          mv target/${{ matrix.arch.target }}/release/wg-multizone target/${{ matrix.arch.target }}/release/wg-multizone-${{ matrix.arch.name }}
+      - name: publish artifacts
+        if: startsWith(github.ref, 'refs/tags/')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            target/${{ matrix.arch.target }}/release/wg-multizone-${{ matrix.arch.name }}
