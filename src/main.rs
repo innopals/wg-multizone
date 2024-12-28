@@ -86,7 +86,6 @@ async fn fetch_and_apply_config(
         if interface_config.port == 0 {
             wgapi.create_interface()?;
         }
-        // let my_cidr = IpAddrMask::from_str(&my_config.internal_cidr)?;
         interface_config.address = my_config.internal_cidr.clone();
         interface_config.port = my_config.port;
         interface_config.mtu = Some(r.mtu);
@@ -104,9 +103,19 @@ async fn fetch_and_apply_config(
         let mut should_reconfigure = false;
         let mut peer_cidr = IpAddrMask::from_str(&peer.internal_cidr)?;
         peer_cidr.cidr = 32;
+        let peer_endpoint_ip = if my_config.vpc_id.is_some()
+            && my_config.vpc_id == peer.vpc_id
+            && peer.vpc_ip.is_some()
+        {
+            peer.vpc_ip.as_ref().unwrap().clone()
+        } else {
+            peer.ip.clone()
+        };
         if let Some(p) = current_peer {
             if let Some(endpoint) = p.endpoint {
-                if endpoint.ip().to_string() != peer.ip || endpoint.port() as u32 != peer.port {
+                if endpoint.ip().to_string() != peer_endpoint_ip
+                    || endpoint.port() as u32 != peer.port
+                {
                     should_reconfigure = true;
                 }
             } else {
@@ -121,18 +130,22 @@ async fn fetch_and_apply_config(
             should_reconfigure = true;
         }
         if should_reconfigure {
-            let peer = Peer {
+            let wg_peer = Peer {
                 public_key: pubkey,
                 preshared_key: None,
                 protocol_version: None,
-                endpoint: Some(format!("{}:{}", peer.ip, peer.port).parse()?),
+                endpoint: Some(format!("{}:{}", peer_endpoint_ip, peer.port).parse()?),
                 last_handshake: None,
                 tx_bytes: 0,
                 rx_bytes: 0,
                 persistent_keepalive_interval: None,
                 allowed_ips: vec![peer_cidr],
             };
-            wgapi.configure_peer(&peer)?;
+            println!(
+                "Configuring peer: {} {} {}",
+                &peer.pubkey, &peer_endpoint_ip, &peer.internal_cidr
+            );
+            wgapi.configure_peer(&wg_peer)?;
         }
     }
     for peer in current_peers.peers.iter() {
@@ -158,7 +171,6 @@ async fn main() {
     let wgapi =
         WGApi::<defguard_wireguard_rs::Userspace>::new(config.interface_name.clone()).unwrap();
 
-    // create interface
     let mut interface_config = InterfaceConfiguration {
         name: config.interface_name.clone(),
         prvkey: base64::engine::general_purpose::STANDARD.encode(secret_key.as_bytes()),

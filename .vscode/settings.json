@@ -1,15 +1,23 @@
 {
   "cSpell.words": [
     "appender",
+    "binstall",
     "dalek",
     "defguard",
     "getrandom",
     "jemallocator",
+    "keepalive",
     "multizone",
+    "preshared",
+    "prvkey",
     "reqwest",
+    "rustup",
     "serde",
+    "softprops",
+    "swatinem",
     "thiserror",
     "tikv",
+    "tlsv",
     "userspace",
     "wgapi"
   ]
