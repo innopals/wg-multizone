@@ -1,6 +1,6 @@
 use std::{
     error::Error,
-    fs::{read_to_string, File},
+    fs::{File, read_to_string},
     io::Write,
     path::Path,
     str::FromStr,
@@ -9,11 +9,18 @@ use std::{
 
 use base64::Engine;
 use defguard_wireguard_rs::{
-    host::Peer, key::Key, net::IpAddrMask, InterfaceConfiguration, WGApi, WireguardInterfaceApi,
+    InterfaceConfiguration, WGApi, WireguardInterfaceApi, host::Peer, key::Key, net::IpAddrMask,
 };
 use serde::{Deserialize, Serialize};
 use tokio::time::sleep;
 use x25519_dalek::{PublicKey, StaticSecret};
+
+#[cfg(not(any(target_os = "macos", target_os = "windows", target_arch = "arm")))]
+use tikv_jemallocator::Jemalloc;
+
+#[cfg(not(any(target_os = "macos", target_os = "windows", target_arch = "arm")))]
+#[global_allocator]
+static GLOBAL: Jemalloc = Jemalloc;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct ServerConfig {
@@ -79,14 +86,19 @@ async fn fetch_and_apply_config(
         return Ok(());
     }
     let my_config = my_config.unwrap();
-    if my_config.internal_cidr != interface_config.address
+    let current_address = if interface_config.addresses.len() > 0 {
+        interface_config.addresses[0].to_string()
+    } else {
+        "".to_string()
+    };
+    if current_address != my_config.internal_cidr
         || my_config.port != interface_config.port
         || Some(r.mtu) != interface_config.mtu
     {
         if interface_config.port == 0 {
             wgapi.create_interface()?;
         }
-        interface_config.address = my_config.internal_cidr.clone();
+        interface_config.addresses = vec![IpAddrMask::from_str(&my_config.internal_cidr)?];
         interface_config.port = my_config.port;
         interface_config.mtu = Some(r.mtu);
         wgapi.configure_interface(&interface_config)?;
@@ -174,7 +186,7 @@ async fn main() {
     let mut interface_config = InterfaceConfiguration {
         name: config.interface_name.clone(),
         prvkey: base64::engine::general_purpose::STANDARD.encode(secret_key.as_bytes()),
-        address: "".to_owned(),
+        addresses: vec![],
         port: 0,
         peers: vec![],
         mtu: None,

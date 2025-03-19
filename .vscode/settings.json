@@ -5,6 +5,7 @@
     "dalek",
     "defguard",
     "getrandom",
+    "jemalloc",
     "jemallocator",
     "keepalive",
     "multizone",
