@@ -11,6 +11,7 @@ use base64::Engine;
 use defguard_wireguard_rs::{
     InterfaceConfiguration, WGApi, WireguardInterfaceApi, host::Peer, key::Key, net::IpAddrMask,
 };
+use openssl::symm::{Cipher, Crypter, Mode};
 use serde::{Deserialize, Serialize};
 use tokio::time::sleep;
 use x25519_dalek::{PublicKey, StaticSecret};
@@ -42,6 +43,7 @@ struct NetworkConfig {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct DaemonConfig {
     pub config_url: String,
+    pub secret: Option<String>,
     pub fetch_interval: u64,
     pub interface_name: String,
 }
@@ -65,16 +67,60 @@ fn load_key() -> (PublicKey, StaticSecret) {
     (pubkey, secret_key)
 }
 
+fn decrypt_config(encrypted: &str, secret: &str) -> Result<String, Box<dyn Error>> {
+    // Step 1: Base64 decode
+    let data = base64::engine::general_purpose::STANDARD
+        .decode(encrypted)
+        .unwrap();
+
+    // Step 2: Verify prefix
+    assert!(&data[0..8] == b"Salted__");
+    let salt = &data[8..16];
+    let ciphertext = &data[16..];
+
+    // Step 3: Derive key and iv using PBKDF2-HMAC-SHA256
+    let mut key = [0u8; 32]; // AES-256 => 32-byte key
+    let mut iv = [0u8; 16]; // CBC IV
+    let mut derived = [0u8; 48]; // key + iv = 48 bytes total
+
+    openssl::pkcs5::pbkdf2_hmac(
+        secret.as_bytes(),
+        salt,
+        10_000,
+        openssl::hash::MessageDigest::sha256(),
+        &mut derived,
+    )
+    .unwrap();
+    key.copy_from_slice(&derived[..32]);
+    iv.copy_from_slice(&derived[32..48]);
+
+    // Step 4: Decrypt
+    let cipher = Cipher::aes_256_cbc();
+    let mut crypter = Crypter::new(cipher, Mode::Decrypt, &key, Some(&iv)).unwrap();
+    crypter.pad(true);
+
+    let mut plaintext = vec![0; ciphertext.len() + cipher.block_size()];
+    let mut count = crypter.update(ciphertext, &mut plaintext).unwrap();
+    count += crypter.finalize(&mut plaintext[count..]).unwrap();
+    plaintext.truncate(count);
+
+    Ok(String::from_utf8(plaintext)?)
+}
+
 async fn fetch_and_apply_config(
     wgapi: &WGApi,
     interface_config: &mut InterfaceConfiguration,
     pubkey: &str,
     config: &DaemonConfig,
 ) -> Result<(), Box<dyn Error>> {
-    let r = reqwest::get(&config.config_url)
-        .await?
-        .json::<NetworkConfig>()
-        .await?;
+    let mut r = reqwest::get(&config.config_url).await?.text().await?;
+    if config.secret.is_some() {
+        r = decrypt_config(
+            &r.replace("\n", "").replace(" ", ""),
+            &config.secret.as_ref().unwrap(),
+        )?;
+    }
+    let r: NetworkConfig = serde_json::from_str(&r)?;
     let mut my_config: Option<ServerConfig> = None;
     for peer in r.peers.iter() {
         if peer.pubkey == pubkey {
@@ -198,5 +244,26 @@ async fn main() {
             println!("Failed to apply config: {:?}", r.unwrap_err());
         }
         sleep(Duration::from_secs(config.fetch_interval)).await;
+    }
+}
+
+#[cfg(test)]
+mod test {
+    use super::*;
+
+    #[tokio::test]
+    async fn test_decrypt_config() {
+        // cat servers.json | openssl enc -aes-256-cbc -a -salt -pbkdf2 -pass pass:mysecret
+        let mut r = r#"
+            U2FsdGVkX19nIrNUt9Wpcyw2qK2rEqJkHX6Wv7ot3sZGR5wIBtkHPvmBXkre46a4
+            T+8hHiRtwvrZZithpFHi9Y1Tq+T7DrwT4A1auJ15ZZbRSEA5quEl/ywF/65FaDeA
+            5uhj5lr+BcO8bvLbT7dQzmpAP7rCzY0l067fQh6pNuaiDhK31XnZ0WIK/E+o5k+1
+            +JwiloAjeMGdP5jNFTws+XjFTPYPJAfhIVdpGqfmb5+hFZh9rZsRTsb+TaGC0tWS
+            UtXcZz6A4RmXWLx+YgEGUg=="#
+            .replace("\n", "")
+            .replace(" ", "");
+        r = decrypt_config(&r, "mysecret").unwrap();
+        let r: NetworkConfig = serde_json::from_str(&r).unwrap();
+        println!("{:?}", r);
     }
 }
