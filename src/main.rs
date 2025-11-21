@@ -2,6 +2,7 @@ use std::{
     error::Error,
     fs::{File, read_to_string},
     io::Write,
+    net::IpAddr,
     path::Path,
     str::FromStr,
     time::Duration,
@@ -11,9 +12,11 @@ use base64::Engine;
 use defguard_wireguard_rs::{
     InterfaceConfiguration, WGApi, WireguardInterfaceApi, host::Peer, key::Key, net::IpAddrMask,
 };
+use hickory_resolver::Resolver;
 use openssl::symm::{Cipher, Crypter, Mode};
 use serde::{Deserialize, Serialize};
 use tokio::time::sleep;
+use url::Url;
 use x25519_dalek::{PublicKey, StaticSecret};
 
 #[cfg(not(any(target_os = "macos", target_os = "windows", target_arch = "arm")))]
@@ -32,6 +35,7 @@ struct ServerConfig {
     pub pubkey: String,
     pub vpc_id: Option<String>,
     pub vpc_ip: Option<String>,
+    pub persistent_keepalive_interval: Option<u16>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -65,6 +69,31 @@ fn load_key() -> (PublicKey, StaticSecret) {
     let secret_key = StaticSecret::from(secret_key);
     let pubkey = PublicKey::from(&secret_key);
     (pubkey, secret_key)
+}
+
+async fn fetch_config_content(config_url: &str) -> Result<String, Box<dyn Error>> {
+    // Try to parse as URL first
+    if let Ok(url) = Url::parse(config_url) {
+        match url.scheme() {
+            "file" => {
+                // Handle file:// URLs
+                let path = url.to_file_path().map_err(|_| {
+                    format!("Invalid file URL: {}", config_url)
+                })?;
+                Ok(read_to_string(path)?)
+            }
+            "http" | "https" => {
+                // Handle HTTP(S) URLs
+                Ok(reqwest::get(config_url).await?.text().await?)
+            }
+            scheme => {
+                Err(format!("Unsupported URL scheme: {}", scheme).into())
+            }
+        }
+    } else {
+        // If URL parsing fails, treat it as a plain file path
+        Ok(read_to_string(config_url)?)
+    }
 }
 
 fn decrypt_config(encrypted: &str, secret: &str) -> Result<String, Box<dyn Error>> {
@@ -107,13 +136,40 @@ fn decrypt_config(encrypted: &str, secret: &str) -> Result<String, Box<dyn Error
     Ok(String::from_utf8(plaintext)?)
 }
 
+async fn resolve_to_ip(host: &str) -> Option<String> {
+    // Try to parse as IP address first
+    if let Ok(_) = host.parse::<IpAddr>() {
+        return Some(host.to_string());
+    }
+
+    // If not an IP, try to resolve as domain name
+    let resolver = match Resolver::builder_tokio() {
+        Ok(builder) => builder.build(),
+        Err(e) => {
+            println!("Failed to create DNS resolver: {}", e);
+            return None;
+        }
+    };
+
+    match resolver.lookup_ip(host).await {
+        Ok(response) => {
+            // Get the first IP address from the response
+            response.iter().next().map(|ip| ip.to_string())
+        }
+        Err(e) => {
+            println!("Failed to resolve domain {}: {}", host, e);
+            None
+        }
+    }
+}
+
 async fn fetch_and_apply_config(
     wgapi: &WGApi,
     interface_config: &mut InterfaceConfiguration,
     pubkey: &str,
     config: &DaemonConfig,
 ) -> Result<(), Box<dyn Error>> {
-    let mut r = reqwest::get(&config.config_url).await?.text().await?;
+    let mut r = fetch_config_content(&config.config_url).await?;
     if config.secret.is_some() {
         r = decrypt_config(
             &r.replace("\n", "").replace(" ", ""),
@@ -161,7 +217,7 @@ async fn fetch_and_apply_config(
         let mut should_reconfigure = false;
         let mut peer_cidr = IpAddrMask::from_str(&peer.internal_cidr)?;
         peer_cidr.cidr = 32;
-        let peer_endpoint_ip = if my_config.vpc_id.is_some()
+        let peer_endpoint_host = if my_config.vpc_id.is_some()
             && my_config.vpc_id == peer.vpc_id
             && peer.vpc_ip.is_some()
         {
@@ -169,11 +225,28 @@ async fn fetch_and_apply_config(
         } else {
             peer.ip.clone()
         };
+
+        // Resolve domain name to IP address
+        let peer_endpoint_ip = resolve_to_ip(&peer_endpoint_host).await;
+
+        // Calculate keepalive interval as minimum of both endpoints
+        let keepalive_interval = match (my_config.persistent_keepalive_interval, peer.persistent_keepalive_interval) {
+            (Some(a), Some(b)) => Some(a.min(b)),
+            (Some(a), None) => Some(a),
+            (None, Some(b)) => Some(b),
+            (None, None) => None,
+        };
+
         if let Some(p) = current_peer {
             if let Some(endpoint) = p.endpoint {
-                if endpoint.ip().to_string() != peer_endpoint_ip
-                    || endpoint.port() as u32 != peer.port
-                {
+                if let Some(resolved_ip) = &peer_endpoint_ip {
+                    if endpoint.ip().to_string() != *resolved_ip
+                        || endpoint.port() as u32 != peer.port
+                    {
+                        should_reconfigure = true;
+                    }
+                } else {
+                    // Resolution failed, need to reconfigure to clear endpoint
                     should_reconfigure = true;
                 }
             } else {
@@ -184,24 +257,48 @@ async fn fetch_and_apply_config(
             } else if p.allowed_ips[0] != peer_cidr {
                 should_reconfigure = true;
             }
+            if p.persistent_keepalive_interval != keepalive_interval {
+                should_reconfigure = true;
+            }
         } else {
             should_reconfigure = true;
         }
         if should_reconfigure {
+            let endpoint = match &peer_endpoint_ip {
+                Some(ip) => {
+                    // Check if IP is IPv6 and needs brackets for SocketAddr parsing
+                    let endpoint_str = match ip.parse::<IpAddr>() {
+                        Ok(IpAddr::V6(_)) => format!("[{}]:{}", ip, peer.port),
+                        _ => format!("{}:{}", ip, peer.port),
+                    };
+                    match endpoint_str.parse() {
+                        Ok(addr) => Some(addr),
+                        Err(e) => {
+                            println!("Failed to parse endpoint {}: {}", endpoint_str, e);
+                            None
+                        }
+                    }
+                }
+                None => None,
+            };
             let wg_peer = Peer {
                 public_key: pubkey,
                 preshared_key: None,
                 protocol_version: None,
-                endpoint: Some(format!("{}:{}", peer_endpoint_ip, peer.port).parse()?),
+                endpoint,
                 last_handshake: None,
                 tx_bytes: 0,
                 rx_bytes: 0,
-                persistent_keepalive_interval: None,
+                persistent_keepalive_interval: keepalive_interval,
                 allowed_ips: vec![peer_cidr],
             };
+            let endpoint_display = peer_endpoint_ip
+                .as_ref()
+                .map(|ip| format!("{}:{}", ip, peer.port))
+                .unwrap_or_else(|| "(no endpoint - resolution failed)".to_string());
             println!(
                 "Configuring peer: {} {} {}",
-                &peer.pubkey, &peer_endpoint_ip, &peer.internal_cidr
+                &peer.pubkey, endpoint_display, &peer.internal_cidr
             );
             wgapi.configure_peer(&wg_peer)?;
         }
