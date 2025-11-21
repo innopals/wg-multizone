@@ -83,8 +83,11 @@ async fn fetch_config_content(config_url: &str) -> Result<String, Box<dyn Error>
                 Ok(read_to_string(path)?)
             }
             "http" | "https" => {
-                // Handle HTTP(S) URLs
-                Ok(reqwest::get(config_url).await?.text().await?)
+                // Handle HTTP(S) URLs with 30-second timeout
+                let client = reqwest::Client::builder()
+                    .timeout(Duration::from_secs(30))
+                    .build()?;
+                Ok(client.get(config_url).send().await?.text().await?)
             }
             scheme => {
                 Err(format!("Unsupported URL scheme: {}", scheme).into())
