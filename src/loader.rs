@@ -42,8 +42,8 @@ pub(crate) async fn fetch_and_apply_config(
     config: &DaemonConfig,
 ) -> Result<(), Box<dyn Error>> {
     let mut r = fetch_config_content(&config.config_url).await?;
-    if config.secret.is_some() {
-        r = decrypt_config(&r, &config.secret.as_ref().unwrap())?;
+    if let Some(secret) = &config.secret {
+        r = decrypt_config(&r, secret)?;
     }
     let r: NetworkConfig = serde_json::from_str(&r)?;
     let mut my_config: Option<ServerConfig> = None;

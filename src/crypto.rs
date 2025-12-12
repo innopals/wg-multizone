@@ -6,8 +6,7 @@ use openssl::symm::{Cipher, Crypter, Mode};
 pub fn decrypt_config(encrypted: &str, secret: &str) -> Result<String, Box<dyn Error>> {
     // Step 1: Base64 decode
     let data = base64::engine::general_purpose::STANDARD
-        .decode(encrypted.replace("\n", "").replace(" ", ""))
-        .unwrap();
+        .decode(encrypted.replace("\n", "").replace(" ", ""))?;
 
     // Step 2: Verify prefix
     assert!(&data[0..8] == b"Salted__");
@@ -25,19 +24,18 @@ pub fn decrypt_config(encrypted: &str, secret: &str) -> Result<String, Box<dyn E
         10_000,
         openssl::hash::MessageDigest::sha256(),
         &mut derived,
-    )
-    .unwrap();
+    )?;
     key.copy_from_slice(&derived[..32]);
     iv.copy_from_slice(&derived[32..48]);
 
     // Step 4: Decrypt
     let cipher = Cipher::aes_256_cbc();
-    let mut crypter = Crypter::new(cipher, Mode::Decrypt, &key, Some(&iv)).unwrap();
+    let mut crypter = Crypter::new(cipher, Mode::Decrypt, &key, Some(&iv))?;
     crypter.pad(true);
 
     let mut plaintext = vec![0; encrypted.len() + cipher.block_size()];
-    let mut count = crypter.update(encrypted, &mut plaintext).unwrap();
-    count += crypter.finalize(&mut plaintext[count..]).unwrap();
+    let mut count = crypter.update(encrypted, &mut plaintext)?;
+    count += crypter.finalize(&mut plaintext[count..])?;
     plaintext.truncate(count);
 
     Ok(String::from_utf8(plaintext)?)
